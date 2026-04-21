@@ -14,8 +14,9 @@ use futures_util::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::sync::{broadcast, RwLock};
 use tower_http::cors::CorsLayer;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 pub mod sentinel {
     pub mod market {
@@ -41,6 +42,8 @@ use sentinel::market::v1::AggTrade;
 
 struct AppState {
     nats_client: Client,
+    report_history: RwLock<Vec<ExecutionReport>>,
+    broadcast_tx: broadcast::Sender<StreamBundle>,
 }
 
 #[tokio::main]
@@ -53,9 +56,51 @@ async fn main() -> Result<()> {
         .await
         .context("CRITICAL: NATS omurgasına bağlanılamadı.")?;
 
-    info!("🔗 Sentinel-API (Full-Duplex Multiplexer) NATS omurgasına bağlandı.");
+    info!("🔗 Sentinel-API (Cached Multiplexer) NATS omurgasına bağlandı.");
 
-    let shared_state = Arc::new(AppState { nats_client });
+    let (tx, _rx) = broadcast::channel(1024);
+    let shared_state = Arc::new(AppState {
+        nats_client: nats_client.clone(),
+        report_history: RwLock::new(Vec::new()),
+        broadcast_tx: tx.clone(),
+    });
+
+    // 🟢 GLOBAL NATS DİNLEYİCİSİ
+    let state_clone = shared_state.clone();
+    tokio::spawn(async move {
+        let mut sub = state_clone.nats_client.subscribe("*.>").await.unwrap();
+        while let Some(msg) = sub.next().await {
+            // Clippy Uyumlu Doğrudan Nesne Yaratımı (Direct Initialization)
+            let bundle_opt = if msg.subject.contains("market.trade") {
+                if let Ok(trade) = AggTrade::decode(msg.payload.clone()) {
+                    Some(StreamBundle {
+                        message: Some(BundleMsg::Trade(trade)),
+                    })
+                } else {
+                    None
+                }
+            } else if msg.subject.contains("execution.report") {
+                if let Ok(report) = ExecutionReport::decode(msg.payload.clone()) {
+                    let mut history = state_clone.report_history.write().await;
+                    history.push(report.clone());
+                    if history.len() > 100 {
+                        history.remove(0);
+                    }
+                    Some(StreamBundle {
+                        message: Some(BundleMsg::Report(report)),
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            if let Some(bundle) = bundle_opt {
+                let _ = state_clone.broadcast_tx.send(bundle);
+            }
+        }
+    });
 
     let app = Router::new()
         .route("/ws/v1/pipeline", get(ws_handler))
@@ -76,65 +121,58 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) ->
 }
 
 async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
-    info!("📱 Terminal bağlantısı kabul edildi (Çift Yönlü Zarf Modu)");
+    info!("📱 Yeni Terminal Bağlandı. Geçmiş Yükleniyor...");
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
+    let mut rx = state.broadcast_tx.subscribe();
 
-    // TASK 1: NATS'tan oku -> Terminal'e gönder
-    let nats_sub_client = state.nats_client.clone();
+    // 1. ADIM: EKRAN BOŞ KALMASIN DİYE ÖNCE GEÇMİŞ İŞLEMLERİ (CACHE) GÖNDER
+    {
+        let history = state.report_history.read().await;
+        for report in history.iter() {
+            // Clippy Uyumlu (Direct Initialization)
+            let bundle = StreamBundle {
+                message: Some(BundleMsg::Report(report.clone())),
+            };
+            let mut buf = Vec::new();
+            if bundle.encode(&mut buf).is_ok() {
+                let _ = ws_sender.send(Message::Binary(buf)).await;
+            }
+        }
+    }
+    info!("✅ Geçmiş başarıyla aktarıldı, Canlı Akışa geçiliyor.");
+
+    // 2. ADIM: CANLI YAYINI TERMİNALE İLET
     let send_task = tokio::spawn(async move {
-        let mut sub = match nats_sub_client.subscribe("*.>").await {
-            Ok(s) => s,
-            Err(e) => {
-                error!("NATS Abonelik Hatası: {}", e);
-                return;
-            }
-        };
-
-        while let Some(msg) = sub.next().await {
-            let mut bundle = StreamBundle::default();
-
-            if msg.subject.contains("market.trade") {
-                if let Ok(trade) = AggTrade::decode(msg.payload.clone()) {
-                    bundle.message = Some(BundleMsg::Trade(trade));
-                }
-            } else if msg.subject.contains("execution.report") {
-                if let Ok(report) = ExecutionReport::decode(msg.payload.clone()) {
-                    bundle.message = Some(BundleMsg::Report(report));
-                }
-            }
-
-            if bundle.message.is_some() {
-                let mut buf = Vec::new();
-                if bundle.encode(&mut buf).is_ok()
-                    && ws_sender.send(Message::Binary(buf)).await.is_err()
-                {
-                    warn!("🔌 Terminal bağlantısı koptu (Sender)");
-                    break;
-                }
+        while let Ok(bundle) = rx.recv().await {
+            let mut buf = Vec::new();
+            if bundle.encode(&mut buf).is_ok()
+                && ws_sender.send(Message::Binary(buf)).await.is_err()
+            {
+                warn!("🔌 Terminal koptu, yayın kesildi.");
+                break;
             }
         }
     });
 
-    // TASK 2: Terminalden oku -> NATS'a gönder (Kill Switch vb. komutlar için)
-    let nats_pub_client = state.nats_client.clone();
+    // 3. ADIM: TERMİNALDEN GELEN KOMUTLARI DİNLE
+    let nats_pub = state.nats_client.clone();
     let recv_task = tokio::spawn(async move {
         while let Some(Ok(Message::Binary(bin))) = ws_receiver.next().await {
             if let Ok(bundle) = StreamBundle::decode(bin.as_slice()) {
                 if let Some(BundleMsg::Command(cmd)) = bundle.message {
                     let mut buf = Vec::new();
                     if cmd.encode(&mut buf).is_ok() {
-                        let _ = nats_pub_client
+                        let _ = nats_pub
                             .publish("control.command".to_string(), buf.into())
                             .await;
-                        warn!("🛑 [API] Terminalden KONTROL KOMUTU alındı ve NATS'a iletildi!");
+                        warn!("🛑 [API] KONTROL KOMUTU ALINDI VE SİSTEME İLETİLDİ!");
                     }
                 }
             }
         }
     });
 
-    // İki task'ten biri kapanana kadar bekle
     tokio::select! {
         _ = send_task => {},
         _ = recv_task => {},

@@ -34,11 +34,15 @@ pub mod sentinel {
             include!(concat!(env!("OUT_DIR"), "/sentinel.api.v1.rs"));
         }
     }
+    pub mod wallet {
+        pub mod v1 {
+            include!(concat!(env!("OUT_DIR"), "/sentinel.wallet.v1.rs"));
+        }
+    }
 }
 
 use sentinel::api::v1::{stream_bundle::Message as BundleMsg, StreamBundle};
 use sentinel::execution::v1::ExecutionReport;
-use sentinel::market::v1::AggTrade;
 
 struct AppState {
     nats_client: Client,
@@ -70,9 +74,8 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         let mut sub = state_clone.nats_client.subscribe("*.>").await.unwrap();
         while let Some(msg) = sub.next().await {
-            // Clippy Uyumlu Doğrudan Nesne Yaratımı (Direct Initialization)
             let bundle_opt = if msg.subject.contains("market.trade") {
-                if let Ok(trade) = AggTrade::decode(msg.payload.clone()) {
+                if let Ok(trade) = sentinel::market::v1::AggTrade::decode(msg.payload.clone()) {
                     Some(StreamBundle {
                         message: Some(BundleMsg::Trade(trade)),
                     })
@@ -80,7 +83,9 @@ async fn main() -> Result<()> {
                     None
                 }
             } else if msg.subject.contains("execution.report") {
-                if let Ok(report) = ExecutionReport::decode(msg.payload.clone()) {
+                if let Ok(report) =
+                    sentinel::execution::v1::ExecutionReport::decode(msg.payload.clone())
+                {
                     let mut history = state_clone.report_history.write().await;
                     history.push(report.clone());
                     if history.len() > 100 {
@@ -88,6 +93,17 @@ async fn main() -> Result<()> {
                     }
                     Some(StreamBundle {
                         message: Some(BundleMsg::Report(report)),
+                    })
+                } else {
+                    None
+                }
+            } else if msg.subject.contains("wallet.equity") {
+                // YENİ: Cüzdan verisini yakala ve WebSocket Zarfına Koy
+                if let Ok(equity) =
+                    sentinel::wallet::v1::EquitySnapshot::decode(msg.payload.clone())
+                {
+                    Some(StreamBundle {
+                        message: Some(BundleMsg::Equity(equity)),
                     })
                 } else {
                     None

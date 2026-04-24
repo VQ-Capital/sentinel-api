@@ -60,19 +60,21 @@ async fn main() -> Result<()> {
         .await
         .context("CRITICAL: NATS omurgasına bağlanılamadı.")?;
 
-    info!("🔗 Sentinel-API (Cached Multiplexer) NATS omurgasına bağlandı.");
+    info!("🔗 Sentinel-API (V3 Multiplexer) NATS omurgasına bağlandı.");
 
-    let (tx, _rx) = broadcast::channel(1024);
+    let (tx, _rx) = broadcast::channel(2048); // Buffer boyutu artırıldı
     let shared_state = Arc::new(AppState {
         nats_client: nats_client.clone(),
         report_history: RwLock::new(Vec::new()),
         broadcast_tx: tx.clone(),
     });
 
-    // 🟢 GLOBAL NATS DİNLEYİCİSİ
+    // 🟢 GLOBAL NATS LISTENER (The Pipe)
     let state_clone = shared_state.clone();
     tokio::spawn(async move {
+        // NATS'taki her şeyi dinle
         let mut sub = state_clone.nats_client.subscribe("*.>").await.unwrap();
+
         while let Some(msg) = sub.next().await {
             let bundle_opt = if msg.subject.contains("market.trade") {
                 if let Ok(trade) = sentinel::market::v1::AggTrade::decode(msg.payload.clone()) {
@@ -86,6 +88,7 @@ async fn main() -> Result<()> {
                 if let Ok(report) =
                     sentinel::execution::v1::ExecutionReport::decode(msg.payload.clone())
                 {
+                    // İşlem geçmişini önbelleğe al (Terminal yeni bağlandığında görsün)
                     let mut history = state_clone.report_history.write().await;
                     history.push(report.clone());
                     if history.len() > 100 {
@@ -98,7 +101,6 @@ async fn main() -> Result<()> {
                     None
                 }
             } else if msg.subject.contains("wallet.equity") {
-                // YENİ: Cüzdan verisini yakala ve WebSocket Zarfına Koy
                 if let Ok(equity) =
                     sentinel::wallet::v1::EquitySnapshot::decode(msg.payload.clone())
                 {
@@ -108,11 +110,23 @@ async fn main() -> Result<()> {
                 } else {
                     None
                 }
+            } else if msg.subject.contains("state.vector") {
+                // ✅ V3: Z-Score Vektörlerini yakala ve WS Zarfına koy
+                if let Ok(vector) =
+                    sentinel::market::v1::MarketStateVector::decode(msg.payload.clone())
+                {
+                    Some(StreamBundle {
+                        message: Some(BundleMsg::Vector(vector)),
+                    })
+                } else {
+                    None
+                }
             } else {
                 None
             };
 
             if let Some(bundle) = bundle_opt {
+                // Tüm WebSocket istemcilerine yay
                 let _ = state_clone.broadcast_tx.send(bundle);
             }
         }
@@ -125,10 +139,9 @@ async fn main() -> Result<()> {
 
     let addr = "0.0.0.0:8080";
     let listener = TcpListener::bind(addr).await?;
-    info!("🚀 VQ-API Gateway {} üzerinde aktif.", addr);
+    info!("🚀 VQ-API Gateway is active on {}", addr);
 
     axum::serve(listener, app).await?;
-
     Ok(())
 }
 
@@ -137,16 +150,15 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) ->
 }
 
 async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
-    info!("📱 Yeni Terminal Bağlandı. Geçmiş Yükleniyor...");
-
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let mut rx = state.broadcast_tx.subscribe();
 
-    // 1. ADIM: EKRAN BOŞ KALMASIN DİYE ÖNCE GEÇMİŞ İŞLEMLERİ (CACHE) GÖNDER
+    info!("📱 Yeni Terminal Bağlandı. Geçmiş veriler aktarılıyor...");
+
+    // 1. Önce Önbellekteki Raporları Gönder (Ekran boş kalmasın)
     {
         let history = state.report_history.read().await;
         for report in history.iter() {
-            // Clippy Uyumlu (Direct Initialization)
             let bundle = StreamBundle {
                 message: Some(BundleMsg::Report(report.clone())),
             };
@@ -156,22 +168,20 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             }
         }
     }
-    info!("✅ Geçmiş başarıyla aktarıldı, Canlı Akışa geçiliyor.");
 
-    // 2. ADIM: CANLI YAYINI TERMİNALE İLET
+    // 2. Canlı Akışı Başlat
     let send_task = tokio::spawn(async move {
         while let Ok(bundle) = rx.recv().await {
             let mut buf = Vec::new();
             if bundle.encode(&mut buf).is_ok()
                 && ws_sender.send(Message::Binary(buf)).await.is_err()
             {
-                warn!("🔌 Terminal koptu, yayın kesildi.");
-                break;
+                break; // Bağlantı koptu
             }
         }
     });
 
-    // 3. ADIM: TERMİNALDEN GELEN KOMUTLARI DİNLE
+    // 3. Terminalden Gelen Komutları NATS'a Bas (Ters Yönlü İletişim)
     let nats_pub = state.nats_client.clone();
     let recv_task = tokio::spawn(async move {
         while let Some(Ok(Message::Binary(bin))) = ws_receiver.next().await {
@@ -182,7 +192,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                         let _ = nats_pub
                             .publish("control.command".to_string(), buf.into())
                             .await;
-                        warn!("🛑 [API] KONTROL KOMUTU ALINDI VE SİSTEME İLETİLDİ!");
+                        warn!("🛑 [API] KONTROL KOMUTU ALINDI VE SISTEME ILETILDI!");
                     }
                 }
             }
@@ -193,4 +203,5 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         _ = send_task => {},
         _ = recv_task => {},
     }
+    info!("🔌 Terminal bağlantısı kesildi.");
 }

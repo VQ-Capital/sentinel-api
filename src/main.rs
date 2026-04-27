@@ -8,7 +8,7 @@ use axum::{
     },
     response::IntoResponse,
     routing::get,
-    Router,
+    Json, Router,
 };
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
@@ -44,15 +44,33 @@ pub mod sentinel {
 use sentinel::api::v1::{stream_bundle::Message as BundleMsg, StreamBundle};
 use sentinel::execution::v1::ExecutionReport;
 
+// Sistem sağlığını tutacak yapı
 struct AppState {
     nats_client: Client,
     report_history: RwLock<Vec<ExecutionReport>>,
     broadcast_tx: broadcast::Sender<StreamBundle>,
+    uptime_start: std::time::Instant,
+}
+
+// Şeffaflık (Diagnose) Rapor Formatı
+#[derive(serde::Serialize)]
+struct SystemHealthReport {
+    status: String,
+    uptime_seconds: u64,
+    active_ui_connections: usize,
+    cached_reports: usize,
+    message: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
+
+    info!(
+        "📡 Service: {} | Version: {}",
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION")
+    );
 
     let nats_url =
         std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_string());
@@ -62,17 +80,17 @@ async fn main() -> Result<()> {
 
     info!("🔗 Sentinel-API (V3 Multiplexer) NATS omurgasına bağlandı.");
 
-    let (tx, _rx) = broadcast::channel(2048); // Buffer boyutu artırıldı
+    let (tx, _rx) = broadcast::channel(2048);
     let shared_state = Arc::new(AppState {
         nats_client: nats_client.clone(),
         report_history: RwLock::new(Vec::new()),
         broadcast_tx: tx.clone(),
+        uptime_start: std::time::Instant::now(),
     });
 
     // 🟢 GLOBAL NATS LISTENER (The Pipe)
     let state_clone = shared_state.clone();
     tokio::spawn(async move {
-        // NATS'taki her şeyi dinle
         let mut sub = state_clone.nats_client.subscribe("*.>").await.unwrap();
 
         while let Some(msg) = sub.next().await {
@@ -88,7 +106,6 @@ async fn main() -> Result<()> {
                 if let Ok(report) =
                     sentinel::execution::v1::ExecutionReport::decode(msg.payload.clone())
                 {
-                    // İşlem geçmişini önbelleğe al (Terminal yeni bağlandığında görsün)
                     let mut history = state_clone.report_history.write().await;
                     history.push(report.clone());
                     if history.len() > 100 {
@@ -111,7 +128,6 @@ async fn main() -> Result<()> {
                     None
                 }
             } else if msg.subject.contains("state.vector") {
-                // ✅ V3: Z-Score Vektörlerini yakala ve WS Zarfına koy
                 if let Ok(vector) =
                     sentinel::market::v1::MarketStateVector::decode(msg.payload.clone())
                 {
@@ -126,14 +142,15 @@ async fn main() -> Result<()> {
             };
 
             if let Some(bundle) = bundle_opt {
-                // Tüm WebSocket istemcilerine yay
                 let _ = state_clone.broadcast_tx.send(bundle);
             }
         }
     });
 
+    // 🚀 FAZ 2: HTTP REST Endpoints Eklendi
     let app = Router::new()
         .route("/ws/v1/pipeline", get(ws_handler))
+        .route("/api/v1/diagnostics", get(diagnostics_handler)) // Yeni Diagnose Ucu
         .layer(CorsLayer::permissive())
         .with_state(shared_state);
 
@@ -143,6 +160,21 @@ async fn main() -> Result<()> {
 
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+// 📊 Yeni REST Handler: UI bu JSON'u okuyup "System Health" penceresi çizebilir
+async fn diagnostics_handler(State(state): State<Arc<AppState>>) -> Json<SystemHealthReport> {
+    let history_len = state.report_history.read().await.len();
+    let active_conns = state.broadcast_tx.receiver_count();
+    let uptime = state.uptime_start.elapsed().as_secs();
+
+    Json(SystemHealthReport {
+        status: "OPERATIONAL".to_string(),
+        uptime_seconds: uptime,
+        active_ui_connections: active_conns,
+        cached_reports: history_len,
+        message: "Precision Engine Active. HFT streams normal.".to_string(),
+    })
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -155,7 +187,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
     info!("📱 Yeni Terminal Bağlandı. Geçmiş veriler aktarılıyor...");
 
-    // 1. Önce Önbellekteki Raporları Gönder (Ekran boş kalmasın)
+    // 1. Önbellekteki Raporları Gönder
     {
         let history = state.report_history.read().await;
         for report in history.iter() {
@@ -176,12 +208,12 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             if bundle.encode(&mut buf).is_ok()
                 && ws_sender.send(Message::Binary(buf)).await.is_err()
             {
-                break; // Bağlantı koptu
+                break;
             }
         }
     });
 
-    // 3. Terminalden Gelen Komutları NATS'a Bas (Ters Yönlü İletişim)
+    // 3. Terminalden Gelen Komutlar (Kill Switch)
     let nats_pub = state.nats_client.clone();
     let recv_task = tokio::spawn(async move {
         while let Some(Ok(Message::Binary(bin))) = ws_receiver.next().await {
